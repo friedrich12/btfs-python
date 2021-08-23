@@ -1,5 +1,6 @@
 import libtorrent
 import tempfile
+import threading
 from stat import *
 import os, stat, errno, time, sys
 # pull in some spaghetti to make this stuff work without fuse-py being installed
@@ -12,9 +13,15 @@ import pycurl
 from io import StringIO
 from fuse import Fuse
 
-session = None 
-handle = None
+session = None
+save_path = str()
+handle = libtorrent.torrent_handle()
+info = None
 
+import logging
+
+logging.basicConfig(filename='app.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s')
+logging.warning('This will get logged to a file')
 
 class btfs_params:
     version = None
@@ -33,6 +40,7 @@ XATTR_IS_BTFS_ROOT = "user.btfs.is_btfs_root"
 XATTR_IS_BTFS = "user.btfs.is_btfs"
 
 params = btfs_params()
+p = libtorrent.add_torrent_params()
 files = {}
 dirs = {}
 
@@ -167,61 +175,43 @@ class HelloFS(Fuse):
         stbuf.f_ffree = 0;
 
 
-    def init(conn):
+    def __init__(self, *args, **kw):
+        
+        global info
+        global handle
+        global session
 
+        Fuse.__init__(self, *args, **kw)
+        print("INIT START")
         time_of_mount = None
 
-        p = fuse_get_context().private_data
+        #flags = libtorrent.session_flags_t.add_default_plugins | libtorrent.session_flags_t.start_default_features
 
-        flags = libtorrent.session.add_default_plugins | libtorrent.session.start_default_features
-
-        alerts = libtorrent.alert.tracker_notification | libtorrent.alert.stats_notification | libtorrent.alert.storage_notification | libtorrent.alert.progress_notification | libtorrent.alert.status_notification | libtorrent.alert.error_notification | libtorrent.alert.dht_notification | libtorrent.alert.peer_notification
-
-        session = libtorrent.session(
-		    libtorrent.fingerprint(
-			    "LT",
-			    LIBTORRENT_VERSION_MAJOR,
-			    LIBTORRENT_VERSION_MINOR,
-			    0,
-			    0),
-		    (params.min_port, params.max_port),
-		    "0.0.0.0",
-		    flags,
-		    alerts)
-
-        se = session.settings()
-
-        se.request_timeout = 10
-        se.strict_end_game_mode = False
-        se.announce_to_all_trackers = True
-        se.announce_to_all_tiers = True
-        se.enable_incoming_tcp = not params.utp_only
-        se.enable_outgoing_tcp = not params.utp_only
-        se.download_rate_limit = params.max_download_rate * 1024
-        se.upload_rate_limit = params.max_upload_rate * 1024
-    
-        session.set_settings(se)
-        session.add_dht_router(("router.bittorrent.com", 6881))
-        session.add_dht_router(("router.utorrent.com", 6881))
-        session.add_dht_router(("dht.transmissionbt.com", 6881))
-        session.async_add_torrent(p)
-
-        pack.set_int(pack.request_timeout, 10)
-        pack.set_str(pack.listen_interfaces, interfaces.str())
-        pack.set_bool(pack.strict_end_game_mode, false)
-        pack.set_bool(pack.announce_to_all_trackers, true)
-        pack.set_bool(pack.announce_to_all_tiers, true)
-        pack.set_bool(pack.enable_incoming_tcp, not params.utp_only)
-        pack.set_bool(pack.enable_outgoing_tcp, not params.utp_only)
-        pack.set_int(pack.download_rate_limit, params.max_download_rate * 1024)
-        pack.set_int(pack.upload_rate_limit, params.max_upload_rate * 1024)
-        pack.set_int(pack.alert_mask, alerts)
-
-        session = libtorrent.session(pack, flags)
-
-        session.add_torrent(p)
+        #alerts = libtorrent.alert.category_t.tracker_notification | libtorrent.alert.category_t.stats_notification | libtorrent.alert.category_t.storage_notification | libtorrent.alert.category_t.progress_notification | libtorrent.alert.category_t.status_notification | libtorrent.alert.category_t.error_notification | libtorrent.alert.category_t.dht_notification | libtorrent.alert.category_t.peer_notification
 
 
+        settings = {
+                'alert_mask': libtorrent.alert.category_t.all_categories,
+                'enable_dht': False, 'enable_lsd': False, 'enable_natpmp': False,
+                'enable_upnp': False, 'listen_interfaces': '0.0.0.0:0', 'file_pool_size': 1,
+                'request_timeout': 10, 'strict_end_game_mode': False, 'announce_to_all_trackers': True,
+                'announce_to_all_tiers': True, 'enable_incoming_tcp': not params.utp_only, 'enable_outgoing_tcp': not params.utp_only}
+                #'download_rate_limit': params.max_download_rate * 1024, 'upload_rate_limit': params.max_upload_rate * 1024}
+
+        session = libtorrent.session(settings)
+        session.listen_on(6881, 6891)
+        session.add_dht_router("router.bittorrent.com", 6881)
+        session.add_dht_router("router.utorrent.com", 6881)
+        session.add_dht_router("dht.transmissionbt.com", 6881)
+
+        info = libtorrent.torrent_info("sample.torrent")
+        handle = session.add_torrent({'ti': info, 'save_path': save_path})
+
+
+        logging.warning("READ TO GO!!")
+
+        x = threading.Thread(target=alert_queue_loop)
+        x.start()
 
     def destroy(user_data):
         flags = 0
@@ -388,15 +378,15 @@ def handle_metadata_received_alert(a):
     setup()
 
 def handle_alert(a):
-    if a.type == libtorrent.read_piece_alert.alert_type:
+    if isinstance(a,libtorrent.read_piece_alert):
         handle_read_piece_alert(a)
-    elif a.type == libtorrent.piece_finished_alert.alert_type:
+    elif isinstance(a,libtorrent.piece_finished_alert):
         handle_piece_finished_alert(a)
-    elif a.type == libtorrent.metadata_received_alert.alert_type:
+    elif isinstance(a, libtorrent.metadata_received_alert):
         handle_metadata_received_alert(a)
-    elif a.type == libtorrent.torrent_added_alert.alert_type:
+    elif isinstance(a, libtorrent.torrent_added_alert):
         handle_torrent_added_alert(a)
-    elif a.type == libtorrent.dht_bootstrap_alert.alert_type:
+    elif isinstance(a, libtorrent.dht_bootstrap_alert):
         # Force DHT announce because libtorrent won't by itself
         handle.force_dht_announce()
     else:
@@ -405,14 +395,15 @@ def handle_alert(a):
 def setup():
     print("Got metadata. Now ready to start downloading.\n")
 
-    ti = handle.torrent_file()
+    print(handle)
+    ti = info
 
     if params.browse_only:
         handle.pause()
 
     for i in range(0,ti.num_files()):
         parent = ""
-        p = str(ti.file_at(i).path.c_str())
+        p = str(ti.file_at(i).path)
 
         if not p:
             continue
@@ -422,7 +413,7 @@ def setup():
             if len(x) <= 0:
                 continue
 
-            if parent.length() <= 0:
+            if len(parent) <= 0:
                 # Root dir <-> children mapping
                 dirs["/"] = x
             else:
@@ -440,13 +431,11 @@ def setup():
     #if (log):
     #    delete log
 
-def alert_queue_loop(data):
+# TODO: FIX THIS CODE
+def alert_queue_loop():
     while True:
-        if not session.wait_for_alert(libtorrent.seconds(1)):
-            continue
-
-        alerts = []
-        session.pop_alerts(alerts)
+        session.wait_for_alert(500)
+        alerts = session.pop_alerts()
 
         for x in alerts:
             handle_alert(x)
@@ -471,7 +460,7 @@ def populate_target(arg):
     except OSError as error:
         pass
 
-    templ += "/btfs-XXXXXX"
+    templ += "/btfs-0101011"
 
 
     try:
@@ -497,72 +486,35 @@ def handle_http(contents, size, nmemb, userp):
     # Must return number of bytes copied
     return nmemb * size
 
-def populate_metadata(p, arg):
-    uri = str(arg)
-
-    if uri.find("http:") == 0 or uri.find("https:") == 0:
-        output = []
-        c = pycurl.Curl()
-        c.setopt(c.URL, uri)
-        c.setopt(c.WRITEFUNCTION, handle_http)
-        c.setopt(c.WRITEDATA, output)
-        c.setopt(c.USERAGENT, "btfs/" + VERSION)
-        c.setopt(c.POSTFIELDS, '@request.json')
-        c.setopt(c.CURLOPT_FOLLOWLOCATION, 1)
-        c.perform()
-        c.close()
-
-        ec = None 
-
-        p.ti = libtorrent.torrent_info(output.buf, output.size, ec)
-
-        if ec:
-            if params.browse_only:
-                p.flags |= libtorrent.add_torrent_params.flag_paused
-        elif uri.find("magnet:") == 0:
-            ec = None
-            parse_magnet_uri(uri, p, ec)
-            if ec:
-                print("Failed to parse magnet\n")
-            else:
-                r = os.path.realpath(uri.c_str())
-
-                if not r:
-                    print("Find metadata failed")
-                ec = None
-                p.ti = libtorrent.torrent_info(r, ec)
-
-                if ec:
-                    print("Parse metadata failed: %s\n")
-
-                if params.browse_only:
-                    p.flags |= libtorrent.add_torrent_params.flag_paused
-    return True
+# Add support for magnet links
+#def populate_metadata():
+#    r = os.path.realpath("sample.torrent")
+#    p.ti = libtorrent.torrent_info(r)
 
 def main():
     params.min_port = 6881            
     params.max_port = 6889
+    params.metadata = "sample.torrent"
     usage="""
 BTFS
 """ + Fuse.fusage
-    server = HelloFS(version="%prog " + fuse.__version__,
-                     usage=usage,
-                dash_s_do='setsingle')
 
     target =populate_target(params.data_directory)
 
-    p = libtorrent.add_torrent_params()
-    p.flags &= ~libtorrent.torrent_flags.auto_managed
-    p.flags &= ~libtorrent.torrent_flags.paused
+    #p = libtorrent.add_torrent_params()
+    #p.flags &= ~libtorrent.torrent_flags.auto_managed
+    #p.flags &= ~libtorrent.torrent_flags.paused
 
-    p.save_path = target + "/files"
+    save_path = target + "/files"
 
     try:
         os.mkdir(p.save_path, 0o777)
     except OSError as error:
         pass
 
-    populate_metadata(p, params.metadata)
+    server = HelloFS(version="%prog " + fuse.__version__,
+                     usage=usage,
+                dash_s_do='setsingle')
     server.parse(errex=1)
     server.main()
 
