@@ -1,4 +1,6 @@
-import libtorrent as lt
+import libtorrent
+import tempfile
+from stat import *
 import os, stat, errno, time, sys
 # pull in some spaghetti to make this stuff work without fuse-py being installed
 try:
@@ -7,13 +9,30 @@ except ImportError:
     pass
 import fuse
 import pycurl
-import StringIO
+from io import StringIO
 from fuse import Fuse
-
 
 session = None 
 handle = None
 
+
+class btfs_params:
+    version = None
+    browse_only = None
+    keep = None
+    utp_only = None
+    data_directory = None
+    min_port = None
+    max_port = None
+    max_download_rate = None
+    max_upload_rate = None
+    metadata = None
+
+XATTR_FILE_INDEX = "user.btfs.file_index"
+XATTR_IS_BTFS_ROOT = "user.btfs.is_btfs_root"
+XATTR_IS_BTFS = "user.btfs.is_btfs"
+
+params = btfs_params()
 files = {}
 dirs = {}
 
@@ -75,7 +94,7 @@ class Read:
         file_size = ti.file_at(index).size;
 
         while size > 0 and offset < file_size:
-            libtorrent.peer_request part = ti.map_file(index, offset, size)
+            part = ti.map_file(index, offset, size)
             part.length = min(ti.piece_size(part.piece) - part.start, part.length)
             
             parts.append(Part(part, buf))
@@ -85,13 +104,13 @@ class Read:
     
     def fail(piece):
         for x in parts:
-            if x.part.piece == piece && not x.filled:
+            if x.part.piece == piece and not x.filled:
                     self.failed = True
     
     #TODO: Check me later
     def copy(piece, buffer, size):
         for x in parts:
-            if x.part.piece == piece && not x.filled:
+            if x.part.piece == piece and not x.filled:
                 i.filled = buf[0:i.part.length] = buffer[i.part.start:]
 
     def trigger():
@@ -127,6 +146,90 @@ class Read:
             return self.size()
 
 class HelloFS(Fuse):
+    def statfs(path, stbuf):
+
+        if not handle.is_valid():
+            return -errno.ENOENT
+
+        st = handle.status();
+
+        if not st.has_metadata:
+            return -errno.ENOENT
+
+        ti = handle.torrent_file()
+
+        stbuf.f_bsize = 4096
+        stbuf.f_frsize = 512
+        stbuf.f_blocks =  (ti.total_size() / 512)
+        stbuf.f_bfree =  ((ti.total_size() - st.total_done) / 512)
+        stbuf.f_bavail =  ((ti.total_size() - st.total_done) / 512)
+        stbuf.f_files =  (files.size() + dirs.size());
+        stbuf.f_ffree = 0;
+
+
+    def init(conn):
+
+        time_of_mount = None
+
+        p = fuse_get_context().private_data
+
+        flags = libtorrent.session.add_default_plugins | libtorrent.session.start_default_features
+
+        alerts = libtorrent.alert.tracker_notification | libtorrent.alert.stats_notification | libtorrent.alert.storage_notification | libtorrent.alert.progress_notification | libtorrent.alert.status_notification | libtorrent.alert.error_notification | libtorrent.alert.dht_notification | libtorrent.alert.peer_notification
+
+        session = libtorrent.session(
+		    libtorrent.fingerprint(
+			    "LT",
+			    LIBTORRENT_VERSION_MAJOR,
+			    LIBTORRENT_VERSION_MINOR,
+			    0,
+			    0),
+		    (params.min_port, params.max_port),
+		    "0.0.0.0",
+		    flags,
+		    alerts)
+
+        se = session.settings()
+
+        se.request_timeout = 10
+        se.strict_end_game_mode = False
+        se.announce_to_all_trackers = True
+        se.announce_to_all_tiers = True
+        se.enable_incoming_tcp = not params.utp_only
+        se.enable_outgoing_tcp = not params.utp_only
+        se.download_rate_limit = params.max_download_rate * 1024
+        se.upload_rate_limit = params.max_upload_rate * 1024
+    
+        session.set_settings(se)
+        session.add_dht_router(("router.bittorrent.com", 6881))
+        session.add_dht_router(("router.utorrent.com", 6881))
+        session.add_dht_router(("dht.transmissionbt.com", 6881))
+        session.async_add_torrent(p)
+
+        pack.set_int(pack.request_timeout, 10)
+        pack.set_str(pack.listen_interfaces, interfaces.str())
+        pack.set_bool(pack.strict_end_game_mode, false)
+        pack.set_bool(pack.announce_to_all_trackers, true)
+        pack.set_bool(pack.announce_to_all_tiers, true)
+        pack.set_bool(pack.enable_incoming_tcp, not params.utp_only)
+        pack.set_bool(pack.enable_outgoing_tcp, not params.utp_only)
+        pack.set_int(pack.download_rate_limit, params.max_download_rate * 1024)
+        pack.set_int(pack.upload_rate_limit, params.max_upload_rate * 1024)
+        pack.set_int(pack.alert_mask, alerts)
+
+        session = libtorrent.session(pack, flags)
+
+        session.add_torrent(p)
+
+
+
+    def destroy(user_data):
+        flags = 0
+
+        if not params.keep:
+            flags |= libtorrent.session.delete_files
+
+        session.remove_torrent(handle, flags)
 
     def getattr(self, path):
         st = MyStat()
@@ -146,9 +249,9 @@ class HelloFS(Fuse):
             file_size = ti.file_at(files[path]).size
             progress = []
             handle.file_progress(progress,libtorrent.torrent_handle.piece_granularity);
-            stbuf->st_blocks = progress[files[path]] / 512
-            stbuf->st_mode = S_IFREG | 0o444
-            stbuf->st_size = file_size
+            stbuf.st_blocks = progress[files[path]] / 512
+            stbuf.st_mode = S_IFREG | 0o444
+            stbuf.st_size = file_size
 
         return st
     
@@ -157,17 +260,15 @@ class HelloFS(Fuse):
         xattrslen = 0;      
  
         if (is_root(path)):           
-            xattrs = XATTR_IS_BTFS "\0" XATTR_IS_BTFS_ROOT
-            xattrslen = sizeof (XATTR_IS_BTFS "\0" XATTR_IS_BTFS_ROOT)
+            xattrs = XATTR_IS_BTFS + "\0" + XATTR_IS_BTFS_ROOT
         elif (is_dir(path)):               
             xattrs = XATTR_IS_BTFS
-            xattrslen = sizeof (XATTR_IS_BTFS)
         elif (is_file(path)):                                  
-            xattrs = XATTR_IS_BTFS "\0" XATTR_FILE_INDEX
-            xattrslen = sizeof (XATTR_IS_BTFS "\0" XATTR_FILE_INDEX)
+            xattrs = XATTR_IS_BTFS + "\0" + XATTR_FILE_INDEX
         else:                     
             return -errno.ENOENT
-                                                                              
+                          
+        xattrslen = len(xttrs)
         # The minimum required length
         if len == 0:                                                 
             return xattrslen
@@ -179,7 +280,7 @@ class HelloFS(Fuse):
 
         return xattrslen
 
-    def btfs_getxattr(path, key, value, len):
+    def getxattr(path, key, value, len):
         position = 0
         xattr = [None] * 16
         xattrlen = 0
@@ -260,8 +361,7 @@ class HelloFS(Fuse):
 
 def handle_read_piece_alert(a):
     if a.ec:
-	print(a.message())
-
+        print(a.message())
         for x in reads:
             x.fail(a.piece)
     else:
@@ -310,143 +410,49 @@ def setup():
     if params.browse_only:
         handle.pause()
 
-    for (int i = 0; i < ti->num_files(); ++i):
+    for i in range(0,ti.num_files()):
         parent = ""
         p = str(ti.file_at(i).path.c_str())
 
         if not p:
             continue
-        for (char *x = strtok(p, "/"); x; x = strtok(NULL, "/")):
+
+        arr = p.split('/')
+        for x in arr:
             if len(x) <= 0:
                 continue
 
             if parent.length() <= 0:
                 # Root dir <-> children mapping
                 dirs["/"] = x
-	    else:
+            else:
                 # Non-root dir <-> children mapping
-		dirs[parent] = x
+                dirs[parent] = x
 
                 parent += "/"
                 parent += x
-		
 
-		free(p);
+                # Path <-> file index mapping
+                files["/" + ti.file_at(i).path] = i
 
-		# Path <-> file index mapping
-		files["/" + ti->file_at(i).path] = i
-
-def alert_queue_loop_destroy(data):
+#def alert_queue_loop_destroy(data):
     #Log *log = (Log *) data;
     #if (log):
     #    delete log
 
-
-def aert_queue_loop(data):
+def alert_queue_loop(data):
     while True:
         if not session.wait_for_alert(libtorrent.seconds(1)):
             continue
 
         alerts = []
-        session.pop_alerts(&alerts)
+        session.pop_alerts(alerts)
 
         for x in alerts:
             handle_alert(x)
 
-def btfs_statfs(path, stbuf):
 
-    if not handle.is_valid():
-        return -errno.ENOENT
-
-    st = handle.status();
-
-    if not st.has_metadata:
-        return -errno.ENOENT
-
-    ti = handle.torrent_file()
-
-    stbuf.f_bsize = 4096
-    stbuf.f_frsize = 512
-    stbuf.f_blocks =  (ti->total_size() / 512)
-    stbuf.f_bfree =  ((ti->total_size() - st.total_done) / 512)
-    stbuf.f_bavail =  ((ti->total_size() - st.total_done) / 512)
-    stbuf.f_files =  (files.size() + dirs.size());
-    stbuf.f_ffree = 0;
-
-
-def btfs_init(conn):
-
-    time_of_mount = None
-
-    p = fuse_get_context()->private_data
-
-    flags = libtorrent.session.add_default_plugins | libtorrent.session.start_default_features
-
-    alerts = libtorrent.alert.tracker_notification |
-		libtorrent.alert.stats_notification |
-		libtorrent.alert.storage_notification |
-		libtorrent.alert.progress_notification |
-		libtorrent.alert.status_notification |
-		libtorrent.alert.error_notification |
-		libtorrent.alert.dht_notification |
-		libtorrent.alert.peer_notification
-
-    session = libtorrent.session(
-		libtorrent.fingerprint(
-			"LT",
-			LIBTORRENT_VERSION_MAJOR,
-			LIBTORRENT_VERSION_MINOR,
-			0,
-			0),
-		(params.min_port, params.max_port),
-		"0.0.0.0",
-		flags,
-		alerts)
-
-    se = session.settings()
-
-    se.request_timeout = 10
-    se.strict_end_game_mode = False
-    se.announce_to_all_trackers = True
-    se.announce_to_all_tiers = True
-    se.enable_incoming_tcp = not params.utp_only
-    se.enable_outgoing_tcp = not params.utp_only
-    se.download_rate_limit = params.max_download_rate * 1024
-    se.upload_rate_limit = params.max_upload_rate * 1024
-
-    session.set_settings(se)
-    session.add_dht_router(("router.bittorrent.com", 6881))
-    session.add_dht_router(("router.utorrent.com", 6881))
-    session.add_dht_router(("dht.transmissionbt.com", 6881))
-    session.async_add_torrent(p)
-
-    pack.set_int(pack.request_timeout, 10)
-    pack.set_str(pack.listen_interfaces, interfaces.str())
-    pack.set_bool(pack.strict_end_game_mode, false)
-    pack.set_bool(pack.announce_to_all_trackers, true)
-    pack.set_bool(pack.announce_to_all_tiers, true)
-    pack.set_bool(pack.enable_incoming_tcp, not params.utp_only)
-    pack.set_bool(pack.enable_outgoing_tcp, not params.utp_only)
-    pack.set_int(pack.download_rate_limit, params.max_download_rate * 1024)
-    pack.set_int(pack.upload_rate_limit, params.max_upload_rate * 1024)
-    pack.set_int(pack.alert_mask, alerts)
-
-    session = libtorrent.session(pack, flags)
-
-    session.add_torrent(p)
-
-
-
-def btfs_destroy(user_data):
-    flags = 0
-
-    if not params.keep:
-        flags |= libtorrent.session.delete_files
-
-    session.remove_torrent(handle, flags)
-
-
-def populate_target(target, arg):
+def populate_target(arg):
     templ = str()
 
     if arg:
@@ -454,33 +460,29 @@ def populate_target(target, arg):
     elif os.getenv("XDG_DATA_HOME"):
         templ += os.getenv("XDG_DATA_HOME")
         templ += "/btfs";
-    elif (getenv("HOME")):
-        templ += getenv("HOME")
+    elif (os.getenv("HOME")):
+        templ += os.getenv("HOME")
         templ += "/btfs"
     else:
         templ += "/tmp/btfs"
 
-    if os.mkdir(templ.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) < 0:
-        if errno != errno.EEXIST:
-            RETV(perror("Failed to create target"), False)
+    try:
+        os.mkdir(str(templ), stat.S_IRWXU | stat.S_IRWXG | stat.S_IROTH | stat.S_IXOTH)
+    except OSError as error:
+        pass
 
-	templ += "/btfs-XXXXXX";
-
-	s = str(templ.c_str())
-
-        if s != None and mkdtemp(s) != None:
-            x = realpath(s, None)
-
-            if x:
-                target = x
-            else:
-                print("FAILED TO EXPAND TARGET")
-
-        else:
-		print("Failed to generate target")
+    templ += "/btfs-XXXXXX"
 
 
-        return target.length() > 0
+    try:
+        os.mkdir(templ)
+        x = os.path.realpath(templ)
+        print(x)
+    except OSError as error:
+        pass
+
+    print(templ)
+    return templ
 
 def handle_http(contents, size, nmemb, userp):
     output = userp
@@ -504,53 +506,63 @@ def populate_metadata(p, arg):
         c.setopt(c.URL, uri)
         c.setopt(c.WRITEFUNCTION, handle_http)
         c.setopt(c.WRITEDATA, output)
-        c.setopt(c.USERAGENT, "btfs/" VERSION)
+        c.setopt(c.USERAGENT, "btfs/" + VERSION)
         c.setopt(c.POSTFIELDS, '@request.json')
         c.setopt(c.CURLOPT_FOLLOWLOCATION, 1)
         c.perform()
-        c.close()      
+        c.close()
 
+        ec = None 
 
-	ec = None 
-
-	p.ti = libtorrent.torrent_info(output.buf, output.size, ec)
+        p.ti = libtorrent.torrent_info(output.buf, output.size, ec)
 
         if ec:
             if params.browse_only:
                 p.flags |= libtorrent.add_torrent_params.flag_paused
-
         elif uri.find("magnet:") == 0:
             ec = None
             parse_magnet_uri(uri, p, ec)
-
             if ec:
                 print("Failed to parse magnet\n")
-        else:
-		r = os.path.realpath(uri.c_str())
+            else:
+                r = os.path.realpath(uri.c_str())
 
-		if not r:
+                if not r:
                     print("Find metadata failed")
-
-		ec = None
-
-		p.ti = libtorrent.torrent_info(r, ec)
+                ec = None
+                p.ti = libtorrent.torrent_info(r, ec)
 
                 if ec:
                     print("Parse metadata failed: %s\n")
 
                 if params.browse_only:
-			p.flags |= libtorrent.add_torrent_params.flag_paused
-
-	return true
+                    p.flags |= libtorrent.add_torrent_params.flag_paused
+    return True
 
 def main():
+    params.min_port = 6881            
+    params.max_port = 6889
     usage="""
-Userspace hello example
+BTFS
 """ + Fuse.fusage
     server = HelloFS(version="%prog " + fuse.__version__,
                      usage=usage,
-                     dash_s_do='setsingle')
+                dash_s_do='setsingle')
 
+    target =populate_target(params.data_directory)
+
+    p = libtorrent.add_torrent_params()
+    p.flags &= ~libtorrent.torrent_flags.auto_managed
+    p.flags &= ~libtorrent.torrent_flags.paused
+
+    p.save_path = target + "/files"
+
+    try:
+        os.mkdir(p.save_path, 0o777)
+    except OSError as error:
+        pass
+
+    populate_metadata(p, params.metadata)
     server.parse(errex=1)
     server.main()
 
