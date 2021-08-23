@@ -14,9 +14,11 @@ from io import StringIO
 from fuse import Fuse
 
 session = None
+reads = []
 save_path = str()
 handle = libtorrent.torrent_handle()
 info = None
+cursor = int()
 
 import logging
 
@@ -52,6 +54,30 @@ fuse.fuse_python_api = (0, 2)
 hello_path = '/hello'
 hello_str = b'Hello World!\n'
 
+def move_to_next_unfinished(piece, num_pieces):
+    global handle
+    for i in range(0, num_pieces):
+        if not handle.have_piece(piece +i):
+            return True
+    return False
+
+def jump(piece, size):
+    tail = piece
+    ti = info
+
+    if not move_to_next_unfinished(tail, ti.num_pieces()):
+        return
+
+    cursor = tail
+
+    for i in range(0, 16):
+        handle.piece_priority(tail, 7)
+        tail+=1
+
+
+def advance():
+    jump(cursor, 0)
+
 #TODO: Update this later
 time_of_mount = 0
 
@@ -83,6 +109,16 @@ class MyStat(fuse.Stat):
         self.st_mtime = 0
         self.st_ctime = 0
 
+class Part:
+    buf = str()
+    filled = False
+    part = libtorrent.peer_request()
+
+    def __init__(self, p, buf):
+       self.part = libtorrent.peer_request(p)
+       self.buf = str(buf)
+       self.filled = False
+
 class Read:
     buf = None
     index = None
@@ -92,6 +128,8 @@ class Read:
     parts = []
 
     def __init__(self, b, idx , off, sz):
+        global handle
+
         self.buf = b
         self.index = idx
         self.offset = off
@@ -176,12 +214,14 @@ class HelloFS(Fuse):
 
 
     def __init__(self, *args, **kw):
-        
+        Fuse.__init__(self, *args, **kw)
         global info
         global handle
         global session
-
-        Fuse.__init__(self, *args, **kw)
+        global save_path
+        
+        save_path = "/home/friedy/btfs/btfs-0101011/files"
+        print("SAVE PATH IS " + save_path)
         print("INIT START")
         time_of_mount = None
 
@@ -303,23 +343,25 @@ class HelloFS(Fuse):
 
 
 
-    def readdir(self, path, buf, offset):
-        if (not is_dir(path) and not is_file(path) and not is_root(path)):
-            return -errno.ENOENT
+    def readdir(self, path, offset):
+        global save_path
+        
+        #if (not is_dir(path) and not is_file(path) and not is_root(path)):
+        #    return -errno.ENOENT
 
-        if (is_file(path)):
-            return -errno.ENOTDIR
+        #if (is_file(path)):
+        #    return -errno.ENOTDIR
 
-        for r in  '.', '..', buf[1:]:
+        for r in  '.', '..', save_path[1:]:
             yield fuse.Direntry(r)
 
-        for i in path:
-            yield fuse.Direntry(r)
+        #for i in path:
+        #    yield fuse.Direntry(r)
 
-        return st
+        #return st
 
     
-    def open(self, path):            
+    def open(self, path, flags):            
         if (not is_dir(path) and not is_file(path)):
             return -errno.ENOENT    
                         
@@ -330,7 +372,10 @@ class HelloFS(Fuse):
         if (flags & accmode) != os.O_RDONLY:
             return -errno.EACCES                                         
                                           
-    def read(self, path, buf, size, offset): 
+    def read(self, path, size, offset): 
+        global save_path
+        global reads
+
         if (not is_dir(path) and not is_file(path)):
             return -errno.ENOENT
                      
@@ -338,11 +383,10 @@ class HelloFS(Fuse):
             return -errno.EISDIR  
                                       
                                                         
-        r = Read(buf, files[path], offset, size)
+        r = Read(save_path, files[path], offset, size)
                                   
         reads.append(r)
                                     
-        # Wait for read to finish             
         s = r.read()                    
                        
         reads.remove(r);
@@ -506,6 +550,7 @@ BTFS
     #p.flags &= ~libtorrent.torrent_flags.paused
 
     save_path = target + "/files"
+    print("SAVE PATH IS " + save_path)
 
     try:
         os.mkdir(p.save_path, 0o777)
