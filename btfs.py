@@ -1,6 +1,6 @@
 import libtorrent
 import tempfile
-import threading
+from threading import *
 from stat import *
 import os, stat, errno, time, sys
 # pull in some spaghetti to make this stuff work without fuse-py being installed
@@ -19,7 +19,6 @@ save_path = str()
 handle = libtorrent.torrent_handle()
 info = None
 cursor = int()
-
 import logging
 
 logging.basicConfig(filename='app.log', filemode='w', format='%(name)s - %(levelname)s - %(message)s')
@@ -54,19 +53,31 @@ fuse.fuse_python_api = (0, 2)
 hello_path = '/hello'
 hello_str = b'Hello World!\n'
 
+temp = int()
+
 def move_to_next_unfinished(piece, num_pieces):
     global handle
+    global temp
+
+
     for i in range(0, num_pieces):
         if not handle.have_piece(piece +i):
+            temp = piece
             return True
+    temp = piece
     return False
 
 def jump(piece, size):
+    global handle
+    global temp
+
     tail = piece
     ti = info
 
     if not move_to_next_unfinished(tail, ti.num_pieces()):
         return
+
+    tail = temp
 
     cursor = tail
 
@@ -82,13 +93,17 @@ def advance():
 time_of_mount = 0
 
 def is_dir(path):
-    if dirs.has_key(path):
+    global dirs
+
+    if path in dirs:
         return True
     else:
         return False
 
 def is_file(path):
-    if files.has_key(path):
+    global files
+
+    if path in files:
         return True
     else:
         return False
@@ -120,59 +135,63 @@ class Part:
        self.filled = False
 
 class Read:
-    buf = None
+    buf = str()
     index = None
     offset = None
     size = None
     failed = False
     parts = []
 
-    def __init__(self, b, idx , off, sz):
+    def __init__(self, idx , off, sz):
         global handle
-
-        self.buf = b
+        
         self.index = idx
         self.offset = off
         self.size = sz
         
         ti = handle.torrent_file() 
 
-        file_size = ti.file_at(index).size;
+        file_size = ti.file_at(self.index).size;
 
         while size > 0 and offset < file_size:
             part = ti.map_file(index, offset, size)
             part.length = min(ti.piece_size(part.piece) - part.start, part.length)
             
-            parts.append(Part(part, buf))
+            self.parts.append(Part(part, buf))
+            
             self.size -= part.length;
             self.offset += part.length;
-            self.buf += part.length
+            #self.buf += part.length
     
     def fail(piece):
-        for x in parts:
+        for x in self.parts:
             if x.part.piece == piece and not x.filled:
                     self.failed = True
     
     #TODO: Check me later
     def copy(piece, buffer, size):
-        for x in parts:
+        for x in self.parts:
             if x.part.piece == piece and not x.filled:
-                i.filled = buf[0:i.part.length] = buffer[i.part.start:]
+                self.buf[0:x.part.length] = buffer[x.part.start:]
+                #if(len(self.buf[0:x.part.length] != 0):
+                x.filled = True
 
     def trigger():
-        for x in parts:
+        global handle
+
+        for x in self.parts:
             if handle.have_piece(x.part.piece):
                 handle.read_piece(x.part.piece)
 
     def finished():
-        for x in parts:
-            if not i.filled:
+        for x in self.parts:
+            if not x.filled:
                 return False
         return True;
 
     def size():
         s = 0
-        for x in parts:
+        for x in self.parts:
             s += x.part.length
         return s;
 
@@ -184,15 +203,40 @@ class Read:
         self.trigger()
 
         # Move sliding window to first piece to serve this request
-        self.jump(parts.front().part.piece, size())
+        jump(parts.front().part.piece, self.size())
 
         if failed:
             return -errno.EIO
         else:
             return self.size()
 
+def alert_queue_loop():
+    global session
+    while True:
+        session.wait_for_alert(5)
+        alerts = session.pop_alerts()
+
+        for x in alerts:
+            handle_alert(x)
+        time.sleep(5)
+
+def start_torrent():
+    global handle
+    global save_path
+    global session
+    global info
+    info = libtorrent.torrent_info("sample.torrent")
+    print("USING SAVE PATH: " + save_path)
+    handle = session.add_torrent({'ti': info , 'save_path': str(save_path)})
+
+    while not handle.is_seed():
+        s = handle.status()
+        time.sleep(5)
+    logging.warning("READ TO GO!!")
+
 class HelloFS(Fuse):
-    def statfs(path, stbuf):
+    def statfs(self):
+        global handle
 
         if not handle.is_valid():
             return -errno.ENOENT
@@ -203,6 +247,8 @@ class HelloFS(Fuse):
             return -errno.ENOENT
 
         ti = handle.torrent_file()
+        
+        stbuf = os.statvfs()
 
         stbuf.f_bsize = 4096
         stbuf.f_frsize = 512
@@ -211,7 +257,8 @@ class HelloFS(Fuse):
         stbuf.f_bavail =  ((ti.total_size() - st.total_done) / 512)
         stbuf.f_files =  (files.size() + dirs.size());
         stbuf.f_ffree = 0;
-
+        
+        return stbuf
 
     def __init__(self, *args, **kw):
         Fuse.__init__(self, *args, **kw)
@@ -220,9 +267,6 @@ class HelloFS(Fuse):
         global session
         global save_path
         
-        save_path = "/home/friedy/btfs/btfs-0101011/files"
-        print("SAVE PATH IS " + save_path)
-        print("INIT START")
         time_of_mount = None
 
         #flags = libtorrent.session_flags_t.add_default_plugins | libtorrent.session_flags_t.start_default_features
@@ -244,16 +288,19 @@ class HelloFS(Fuse):
         session.add_dht_router("router.utorrent.com", 6881)
         session.add_dht_router("dht.transmissionbt.com", 6881)
 
-        info = libtorrent.torrent_info("sample.torrent")
-        handle = session.add_torrent({'ti': info, 'save_path': save_path})
 
-
-        logging.warning("READ TO GO!!")
-
-        x = threading.Thread(target=alert_queue_loop)
+        x = Thread(target=start_torrent)
         x.start()
 
+        y = Thread(target=alert_queue_loop)
+        y.start()
+
+        time.sleep(10)
+
     def destroy(user_data):
+        global session
+        global handle
+
         flags = 0
 
         if not params.keep:
@@ -262,6 +309,10 @@ class HelloFS(Fuse):
         session.remove_torrent(handle, flags)
 
     def getattr(self, path):
+        global handle
+        global save_path
+        global info
+
         st = MyStat()
 
         if(not is_dir(path) and not is_file(path) and not is_root(path)):
@@ -269,96 +320,32 @@ class HelloFS(Fuse):
         
         st.st_uid = os.getuid()
         st.st_gid = os.getgid()
-        st.st_mtime = time_of_mount
+        #st.st_mtime = time_of_mount
 
         if(is_root(path) or is_dir(path)):
-            st_mode = stat.S_IFDIR | 0o755
+            st.st_mode = stat.S_IFDIR | 0o755
         else:
-            ti = handle.torrent_file()
-       
-            file_size = ti.file_at(files[path]).size
-            progress = []
-            handle.file_progress(progress,libtorrent.torrent_handle.piece_granularity);
-            stbuf.st_blocks = progress[files[path]] / 512
-            stbuf.st_mode = S_IFREG | 0o444
-            stbuf.st_size = file_size
+            file_size = info.file_at(files[path]).size
+            progress = handle.file_progress(libtorrent.torrent_handle.piece_granularity);
+            st.st_blocks = progress[files[path]] / 512
+            st.st_mode = stat.S_IFREG | 0o444
+            st.st_size = file_size
 
         return st
     
-    def listxattr(path, data, len):
-        xattrs = None;               
-        xattrslen = 0;      
- 
-        if (is_root(path)):           
-            xattrs = XATTR_IS_BTFS + "\0" + XATTR_IS_BTFS_ROOT
-        elif (is_dir(path)):               
-            xattrs = XATTR_IS_BTFS
-        elif (is_file(path)):                                  
-            xattrs = XATTR_IS_BTFS + "\0" + XATTR_FILE_INDEX
-        else:                     
-            return -errno.ENOENT
-                          
-        xattrslen = len(xttrs)
-        # The minimum required length
-        if len == 0:                                                 
-            return xattrslen
-                             
-        if len < xattrslen:        
-            return -ERANGE;                  
-                                       
-        data[:xattrslen] = xattrs
-
-        return xattrslen
-
-    def getxattr(path, key, value, len):
-        position = 0
-        xattr = [None] * 16
-        xattrlen = 0
-
-        k = str(key)
-
-        if is_file(path) and k == XATTR_FILE_INDEX:
-            xattrlen = snprintf(xattr, sizeof (xattr), "%d", files[path])
-        elif is_root(path) and k == XATTR_IS_BTFS_ROOT:
-            xattrlen = 0
-        elif k == XATTR_IS_BTFS:
-            xattrlen = 0
-        else:
-            return -errno.ENODATA
-
-        # The minimum required length
-        if len == 0:
-            return xattrlen
-
-        if position >= xattrlen:
-            return 0
-
-        if len <  xattrlen - position:
-            return -errno.ERANGE
-
-        
-        value[:xattrlen - position] = xattr[position:]
-        
-        return xattrlen -  position
-
-
-
     def readdir(self, path, offset):
+        global dirs
         global save_path
-        
-        #if (not is_dir(path) and not is_file(path) and not is_root(path)):
-        #    return -errno.ENOENT
 
-        #if (is_file(path)):
-        #    return -errno.ENOTDIR
+        if (not is_dir(path) and not is_file(path) and not is_root(path)):
+            return -errno.ENOENT
 
-        for r in  '.', '..', save_path[1:]:
-            yield fuse.Direntry(r)
+        if (is_file(path)):
+            return -errno.ENOTDIR
 
-        #for i in path:
-        #    yield fuse.Direntry(r)
-
-        #return st
+        for d in dirs[path]:
+            for r in d, save_path[1:]:
+                yield fuse.Direntry(r)
 
     
     def open(self, path, flags):            
@@ -366,15 +353,16 @@ class HelloFS(Fuse):
             return -errno.ENOENT    
                         
         if (is_dir(path)):
-            return -EISDIR
+            return -errno.EISDIR
                                                              
         accmode = os.O_RDONLY | os.O_WRONLY | os.O_RDWR
         if (flags & accmode) != os.O_RDONLY:
-            return -errno.EACCES                                         
+            return -errno.EACCES
                                           
     def read(self, path, size, offset): 
         global save_path
         global reads
+        global files
 
         if (not is_dir(path) and not is_file(path)):
             return -errno.ENOENT
@@ -383,17 +371,18 @@ class HelloFS(Fuse):
             return -errno.EISDIR  
                                       
                                                         
-        r = Read(save_path, files[path], offset, size)
+        r = Read(files[path], offset, size)
                                   
         reads.append(r)
                                     
-        s = r.read()                    
+        r.read()                    
                        
         reads.remove(r);
                                  
-        return s
+        return r.buf
 
 def handle_read_piece_alert(a):
+    global reads
     if a.ec:
         print(a.message())
         for x in reads:
@@ -403,6 +392,7 @@ def handle_read_piece_alert(a):
             x.copy(a.piece, a.buffer.get(), a.size())
 
 def handle_piece_finished_alert(a):
+    global reads
     #printf("%s: %d\n", __func__, static_cast<int>(a->piece_index));
 
     for x in reads:
@@ -412,31 +402,43 @@ def handle_piece_finished_alert(a):
     advance()
 
 def handle_torrent_added_alert(a):
+    global handle
     handle = a.handle
 
     if a.handle.status().has_metadata:
         setup()
 
 def handle_metadata_received_alert(a):
+    global handle
     handle = a.handle
     setup()
 
 def handle_alert(a):
+    global handle
     if isinstance(a,libtorrent.read_piece_alert):
+        print(a.message())
         handle_read_piece_alert(a)
     elif isinstance(a,libtorrent.piece_finished_alert):
+        print(a.message())
         handle_piece_finished_alert(a)
     elif isinstance(a, libtorrent.metadata_received_alert):
+        print(a.message())
         handle_metadata_received_alert(a)
     elif isinstance(a, libtorrent.torrent_added_alert):
+        print(a.message())
         handle_torrent_added_alert(a)
     elif isinstance(a, libtorrent.dht_bootstrap_alert):
         # Force DHT announce because libtorrent won't by itself
+        print(a.message())
         handle.force_dht_announce()
     else:
         print(a.message())
 
 def setup():
+    global handle
+    global files
+    global dirs
+    global info
     print("Got metadata. Now ready to start downloading.\n")
 
     print(handle)
@@ -459,62 +461,57 @@ def setup():
 
             if len(parent) <= 0:
                 # Root dir <-> children mapping
-                dirs["/"] = x
+                if not "/" in dirs:
+                    dirs["/"] = []
+                dirs["/"].append(x)
             else:
                 # Non-root dir <-> children mapping
-                dirs[parent] = x
+                if not parent in dirs:
+                    dirs[parent] = []
+            
+                dirs[parent].append(x)
 
-                parent += "/"
-                parent += x
+            parent += "/"
+            parent += x
 
-                # Path <-> file index mapping
-                files["/" + ti.file_at(i).path] = i
+        # Path <-> file index mapping
+        files["/" + ti.file_at(i).path] = i
+    print("I GOT THIS: ")
+    print(dirs)
+    print("I GOT THIS: ")
+    print(files)
 
 #def alert_queue_loop_destroy(data):
     #Log *log = (Log *) data;
     #if (log):
     #    delete log
 
-# TODO: FIX THIS CODE
-def alert_queue_loop():
-    while True:
-        session.wait_for_alert(500)
-        alerts = session.pop_alerts()
-
-        for x in alerts:
-            handle_alert(x)
-
 
 def populate_target(arg):
-    templ = str()
+    #templ = str()
 
-    if arg:
-        templ += arg;
-    elif os.getenv("XDG_DATA_HOME"):
-        templ += os.getenv("XDG_DATA_HOME")
-        templ += "/btfs";
-    elif (os.getenv("HOME")):
-        templ += os.getenv("HOME")
-        templ += "/btfs"
-    else:
-        templ += "/tmp/btfs"
+    #if arg:
+    #    templ += arg;
+    #elif os.getenv("XDG_DATA_HOME"):
+    #    templ += os.getenv("XDG_DATA_HOME")
+    #    templ += "/btfs";
+    #elif (os.getenv("HOME")):
+    #    templ += os.getenv("HOME")
+    #    templ += "/btfs"
+    #else:
+    #    templ += "/tmp/btfs"
+    #
+    #try:
+    #    os.mkdir(str(templ))
+    #except OSError as error:
+    #    print("Failed to create directory")
+    #    pass
 
-    try:
-        os.mkdir(str(templ), stat.S_IRWXU | stat.S_IRWXG | stat.S_IROTH | stat.S_IXOTH)
-    except OSError as error:
-        pass
+    #templ += "/btfs-XXXXXX"
 
-    templ += "/btfs-0101011"
-
-
-    try:
-        os.mkdir(templ)
-        x = os.path.realpath(templ)
-        print(x)
-    except OSError as error:
-        pass
-
-    print(templ)
+    templ = tempfile.mkdtemp()
+    print("CREATE TEMP DIRECTORY AT: " + templ)
+    
     return templ
 
 def handle_http(contents, size, nmemb, userp):
@@ -536,6 +533,7 @@ def handle_http(contents, size, nmemb, userp):
 #    p.ti = libtorrent.torrent_info(r)
 
 def main():
+    global save_path
     params.min_port = 6881            
     params.max_port = 6889
     params.metadata = "sample.torrent"
@@ -549,11 +547,11 @@ BTFS
     #p.flags &= ~libtorrent.torrent_flags.auto_managed
     #p.flags &= ~libtorrent.torrent_flags.paused
 
-    save_path = target + "/files"
+    save_path = target
     print("SAVE PATH IS " + save_path)
 
     try:
-        os.mkdir(p.save_path, 0o777)
+        os.mkdir(save_path, 0o777)
     except OSError as error:
         pass
 
